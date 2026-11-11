@@ -107,7 +107,7 @@
         <s2.geometry.version>20250620-rc1</s2.geometry.version>
         <sizeof.version>0.4.4</sizeof.version>
         <spring.security.version>7.1.0</spring.security.version>
-        <trino.version>484</trino.version>
+        <trino.version>484-shredded-1</trino.version>
         <typesafe.config.version>1.4.9</typesafe.config.version>
         <zstd.version>1.5.7-7</zstd.version>
 
@@ -233,7 +233,7 @@
         <test.postgres.docker.tag>15.1</test.postgres.docker.tag>
         <test.redis.docker.tag>7-alpine</test.redis.docker.tag>
         <test.spark.docker.tag>${spark.version}-scala${scala.binary.version}-java${jdk.release.version}-ubuntu</test.spark.docker.tag>
-        <test.trino.docker.tag>${trino.version}</test.trino.docker.tag>
+        <test.trino.docker.tag>484</test.trino.docker.tag>
         <test.zookeeper.docker.tag>3.9.4</test.zookeeper.docker.tag>
 
         <!-- documentation/readme -->

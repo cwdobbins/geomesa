@@ -7,6 +7,7 @@
  ***********************************************************************/
 
 package org.locationtech.geomesa.trino.spatial.iceberg.connector;
+import org.locationtech.geomesa.trino.variant.VariantPushdownConfig;
 import org.locationtech.geomesa.trino.security.AuthorizationResolver;
 import org.locationtech.geomesa.trino.security.FileAuthorizationResolver;
 
@@ -126,16 +127,19 @@ public class SpatialConnectorFactory implements ConnectorFactory {
         Set<String> visibilityExpressions = parseVisibilityExpressions(config.get(VISIBILITY_EXPRESSIONS));
         boolean useInvokerAuths = Boolean.parseBoolean(config.getOrDefault(USE_INVOKER_AUTHS, "true"));
 
+        VariantPushdownConfig variantConfig = VariantPushdownConfig.from(config);
+
         // Iceberg uses strict config validation; strip our keys so it doesn't reject them as unused.
         Map<String, String> icebergConfig = new LinkedHashMap<>();
         config.forEach((k, v) -> {
-            if (!k.startsWith(SECURITY_PREFIX) && !k.startsWith(SPATIAL_PREFIX)) icebergConfig.put(k, v);
+            if (!k.startsWith(SECURITY_PREFIX) && !k.startsWith(SPATIAL_PREFIX)
+                    && !k.startsWith(VariantPushdownConfig.PREFIX)) icebergConfig.put(k, v);
         });
 
         ConnectorFactory icebergFactory = new IcebergPlugin().getConnectorFactories().iterator().next();
         Connector icebergConnector = icebergFactory.create(catalogName, icebergConfig, context);
         return new SpatialConnector(icebergConnector, catalogName, resolver, bboxShortCircuit,
-            useInvokerAuths, visibilityPruningEnabled, visibilityExpressions);
+            useInvokerAuths, visibilityPruningEnabled, visibilityExpressions, variantConfig);
     }
 
     /** Parses the comma-separated {@link #VISIBILITY_EXPRESSIONS} property; null/blank yields

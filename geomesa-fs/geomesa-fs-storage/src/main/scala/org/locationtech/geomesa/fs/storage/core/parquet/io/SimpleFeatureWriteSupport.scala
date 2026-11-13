@@ -17,7 +17,7 @@ import org.apache.parquet.io.api.{Binary, RecordConsumer}
 import org.apache.parquet.schema.LogicalTypeAnnotation._
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
 import org.apache.parquet.schema.{GroupType, PrimitiveType, Type}
-import org.apache.parquet.variant.{VariantJsonParser, VariantValueWriter}
+import org.apache.parquet.variant.{VariantBuilder, VariantJsonParser, VariantValueWriter}
 import org.geotools.api.feature.`type`.AttributeDescriptor
 import org.geotools.api.feature.simple.SimpleFeature
 import org.locationtech.geomesa.curve.{XZ2SFC, Z2SFC}
@@ -36,6 +36,7 @@ import org.locationtech.jts.geom._
 
 import java.nio.ByteBuffer
 import java.util.{Date, UUID}
+import scala.collection.mutable.ArrayBuffer
 
 class SimpleFeatureWriteSupport extends WriteSupport[SimpleFeature] {
 
@@ -246,8 +247,73 @@ object SimpleFeatureWriteSupport {
   }
 
   private class VariantWriter(name: String, index: Int, schema: GroupType) extends AttributeWriter[String](name, index) {
-    override def writeFields(consumer: RecordConsumer, value: String): Unit =
-      VariantValueWriter.write(consumer, schema, VariantJsonParser.parseJson(value))
+    override def writeFields(consumer: RecordConsumer, value: String): Unit = {
+      val bounded = if (schema.containsField("typed_value")) {
+        new CompactVariantRecordConsumer(consumer, schema)
+      } else {
+        consumer // Unshredded root buffers are already bounded; preserve their existing write path.
+      }
+      VariantValueWriter.write(bounded, schema, VariantJsonParser.parseJson(value))
+    }
+  }
+
+  /**
+   * parquet-java 1.18.1 exposes child VARIANT buffers extending through their parent's remaining bytes,
+   * and its direct fallback writer emits the whole buffer. Readers tolerate that tail, but wide objects
+   * can duplicate it in many leaves. Restrict only physical fallback binaries to one encoded value.
+   * The public builder copies encoded bytes without changing dictionary IDs or scalar representations.
+   */
+  private class CompactVariantRecordConsumer(delegate: RecordConsumer, schema: GroupType) extends RecordConsumer {
+    private val groups = ArrayBuffer(schema)
+    private val fields = ArrayBuffer.empty[Type]
+    private var depth = 0
+    private lazy val scratch = new EncodedValueBuffer
+
+    private class EncodedValueBuffer extends VariantBuilder {
+      writeBuffer = new Array[Byte](32)
+      def compact(value: ByteBuffer): ByteBuffer = {
+        writePos = 0
+        appendEncodedValue(value)
+        encodedValue()
+      }
+    }
+
+    override def startMessage(): Unit = delegate.startMessage()
+    override def endMessage(): Unit = delegate.endMessage()
+    override def startField(name: String, index: Int): Unit = {
+      fields += groups.last.getType(index)
+      delegate.startField(name, index)
+    }
+    override def endField(name: String, index: Int): Unit = {
+      delegate.endField(name, index)
+      fields.remove(fields.length - 1)
+    }
+    override def startGroup(): Unit = {
+      if (depth > 0) { groups += fields.last.asGroupType() }
+      depth += 1
+      delegate.startGroup()
+    }
+    override def endGroup(): Unit = {
+      delegate.endGroup()
+      depth -= 1
+      if (depth > 0) { groups.remove(groups.length - 1) }
+    }
+    override def addBinary(value: Binary): Unit = {
+      if (fields.last.isPrimitive && fields.last.getName == "value") {
+        val compact = scratch.compact(value.toByteBuffer)
+        delegate.addBinary(if (compact.remaining() == value.length()) { value } else {
+          Binary.fromReusedByteBuffer(compact)
+        })
+      } else {
+        delegate.addBinary(value)
+      }
+    }
+    override def addInteger(value: Int): Unit = delegate.addInteger(value)
+    override def addLong(value: Long): Unit = delegate.addLong(value)
+    override def addBoolean(value: Boolean): Unit = delegate.addBoolean(value)
+    override def addFloat(value: Float): Unit = delegate.addFloat(value)
+    override def addDouble(value: Double): Unit = delegate.addDouble(value)
+    override def flush(): Unit = delegate.flush()
   }
 
   /**

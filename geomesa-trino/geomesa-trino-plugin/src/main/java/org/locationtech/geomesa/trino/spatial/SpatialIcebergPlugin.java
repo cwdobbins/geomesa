@@ -7,11 +7,12 @@
  ***********************************************************************/
 
 package org.locationtech.geomesa.trino.spatial;
-import org.locationtech.geomesa.trino.security.GeoMesaSecurityFunctions;
 
 import io.trino.spi.Plugin;
 import io.trino.spi.connector.ConnectorFactory;
+import org.locationtech.geomesa.trino.security.GeoMesaSecurityFunctions;
 import org.locationtech.geomesa.trino.spatial.iceberg.connector.SpatialConnectorFactory;
+import org.locationtech.geomesa.trino.variant.GeoMesaVariantFunctions;
 
 import java.util.List;
 import java.util.Set;
@@ -42,6 +43,6 @@ public class SpatialIcebergPlugin implements Plugin {
      */
     @Override
     public Set<Class<?>> getFunctions() {
-        return Set.of(GeoMesaSecurityFunctions.class, GeoMesaQueryFunctions.class);
+        return Set.of(GeoMesaSecurityFunctions.class, GeoMesaQueryFunctions.class, GeoMesaVariantFunctions.class);
     }
 }

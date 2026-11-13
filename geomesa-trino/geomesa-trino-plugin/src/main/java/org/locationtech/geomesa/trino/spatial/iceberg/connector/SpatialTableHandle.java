@@ -84,6 +84,7 @@ public record SpatialTableHandle(
 
     /** Unwrap spatial and visibility scan filters to their underlying Iceberg handle. */
     static ConnectorTableHandle unwrap(ConnectorTableHandle handle) {
+        if (handle instanceof VariantTableHandle v) return unwrap(v.delegate());
         if (handle instanceof VisibilityTableHandle v) return unwrap(v.delegate());
         return handle instanceof SpatialTableHandle w ? w.delegate() : handle;
     }

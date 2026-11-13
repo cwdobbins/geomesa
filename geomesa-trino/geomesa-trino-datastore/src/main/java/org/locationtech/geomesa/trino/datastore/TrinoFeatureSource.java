@@ -525,6 +525,19 @@ class TrinoFeatureSource extends ContentFeatureSource {
         }
         SimplifyingFilterVisitor simplifier = new SimplifyingFilterVisitor() {
             @Override
+            public Object visit(org.geotools.api.filter.Not filter, Object data) {
+                // Inverting a comparison can change missing/null JSON semantics and expose a
+                // candidate that was originally under NOT. Keep that residual intact.
+                boolean variant = residualAttributeNames(filter, schema).stream().anyMatch(name -> {
+                    var descriptor = schema.getDescriptor(name);
+                    return descriptor != null && descriptor.getType().getBinding() == String.class
+                        && "true".equals(descriptor.getUserData().get(TrinoTypeMapper.OPT_JSON))
+                        && descriptor.getUserData().get(TrinoTypeMapper.OPT_JSON_SCHEMA) == null;
+                });
+                return variant ? filter : super.visit(filter, data);
+            }
+
+            @Override
             public Object visit(BBOX filter, Object data) {
                 return isWholeWorld(filter) ? Filter.INCLUDE : super.visit(filter, data);
             }

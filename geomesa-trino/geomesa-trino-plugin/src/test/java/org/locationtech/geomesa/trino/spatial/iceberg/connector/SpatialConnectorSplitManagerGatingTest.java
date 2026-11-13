@@ -106,6 +106,9 @@ class SpatialConnectorSplitManagerGatingTest {
     @Test
     void sessionPropertiesDelegateWithoutVisibilitySwitch() {
         SpatialConnector connector = new SpatialConnector(delegateConnector());
-        assertThat(connector.getSessionProperties()).isSameAs(SESSION_PROPERTIES);
+        assertThat(connector.getSessionProperties()).containsAll(SESSION_PROPERTIES);
+        assertThat(connector.getSessionProperties()).extracting(io.trino.spi.session.PropertyMetadata::getName)
+            .contains("variant_filter_mode", "variant_projection_pushdown_enabled", "variant_native_prefilter_enabled").doesNotContain("visibility_filter_enabled");
+        assertThat(connector.getSessionProperties()).hasSize(SESSION_PROPERTIES.size() + 3);
     }
 }

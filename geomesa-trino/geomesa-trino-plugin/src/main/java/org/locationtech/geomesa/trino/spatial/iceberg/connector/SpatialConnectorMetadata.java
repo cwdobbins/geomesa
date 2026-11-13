@@ -8,6 +8,13 @@
 
 package org.locationtech.geomesa.trino.spatial.iceberg.connector;
 
+import org.locationtech.geomesa.trino.variant.VariantPredicate;
+import org.locationtech.geomesa.trino.variant.VariantNativeHint;
+import org.locationtech.geomesa.trino.variant.VariantNativeHintCompiler;
+import org.locationtech.geomesa.trino.variant.VariantProjectionPushdown;
+import org.locationtech.geomesa.trino.variant.VariantFilterPushdown;
+import org.locationtech.geomesa.trino.variant.VariantPushdownConfig;
+
 import io.airlift.slice.Slice;
 import io.airlift.slice.Slices;
 import io.trino.geospatial.serde.JtsGeometrySerde;
@@ -133,6 +140,7 @@ public class SpatialConnectorMetadata implements ConnectorMetadata {
     private static final Map<Class<?>, Method> GEOM_ISRECTANGLE_METHOD = new ConcurrentHashMap<>();
 
     private final ConnectorMetadata delegate;
+    private final boolean variantSessionProperties;
     private final GeoMesaColumnCatalog geomCatalog;
     /** When true, claim eligible rectangle ST_Intersects predicates enforced. */
     private final boolean bboxShortCircuit;
@@ -258,6 +266,14 @@ public class SpatialConnectorMetadata implements ConnectorMetadata {
                                     AuthorizationResolver resolver,
                                     boolean visibilityPruningEnabled,
                                     Set<String> visibilityExpressions) {
+        this(delegate, geomCatalog, bboxShortCircuit, useInvokerAuths, resolver, visibilityPruningEnabled,
+            visibilityExpressions, false);
+    }
+
+    public SpatialConnectorMetadata(ConnectorMetadata delegate, GeoMesaColumnCatalog geomCatalog,
+            boolean bboxShortCircuit, boolean useInvokerAuths, AuthorizationResolver resolver,
+            boolean visibilityPruningEnabled, Set<String> visibilityExpressions, boolean variantSessionProperties) {
+        this.variantSessionProperties = variantSessionProperties;
         this.delegate = delegate;
         this.geomCatalog = geomCatalog;
         this.bboxShortCircuit = bboxShortCircuit;
@@ -287,7 +303,54 @@ public class SpatialConnectorMetadata implements ConnectorMetadata {
     public Optional<ConstraintApplicationResult<ConnectorTableHandle>> applyFilter(
             ConnectorSession session, ConnectorTableHandle handle, Constraint constraint) {
 
-        return applyVisibilityFilter(session, handle, constraint);
+        VariantTableHandle previous = handle instanceof VariantTableHandle variant ? variant : null;
+        ConnectorTableHandle inner = previous == null ? handle : previous.delegate();
+        Optional<ConstraintApplicationResult<ConnectorTableHandle>> delegated = applyVisibilityFilter(session, inner, constraint);
+        ConnectorTableHandle filtered = delegated.map(ConstraintApplicationResult::getHandle).orElse(inner);
+        ConnectorExpression remaining = delegated.flatMap(ConstraintApplicationResult::getRemainingExpression)
+            .orElse(constraint.getExpression());
+        List<VariantPredicate> predicates = new ArrayList<>(previous == null ? List.of() : previous.predicates());
+        List<VariantNativeHint> hints = new ArrayList<>(previous == null ? List.of() : previous.hints());
+        ConnectorTableHandle unwrapped = SpatialTableHandle.unwrap(filtered);
+        if (variantSessionProperties && VariantPushdownConfig.enabled(session)
+                && SpatialTableHandle.unwrap(inner) instanceof IcebergTableHandle original
+                && supportsVariantScan(original) && original.getLimit().isEmpty()
+                && unwrapped instanceof IcebergTableHandle iceberg
+                && supportsVariantScan(iceberg) && iceberg.getLimit().isEmpty()
+                && constraint.getAssignments().values().stream().noneMatch(column ->
+                    column instanceof IcebergColumnHandle iceColumn && iceColumn.isMergeRowIdColumn())
+                && iceberg.getProjectedColumns().stream().noneMatch(IcebergColumnHandle::isMergeRowIdColumn)
+                && VariantFilterPushdown.safeShape(remaining)) {
+            List<VariantPredicate> candidates = VariantFilterPushdown.candidates(remaining, constraint.getAssignments());
+            Set<VariantPredicate> union = new LinkedHashSet<>(predicates);
+            union.addAll(candidates);
+            Set<VariantNativeHint> hintUnion = new LinkedHashSet<>(hints);
+            if (VariantPushdownConfig.nativeEnabled(session)) {
+                hintUnion.addAll(VariantNativeHintCompiler.candidates(remaining, constraint.getAssignments()));
+            }
+            if (union.size() + hintUnion.size() <= 256) {
+                predicates = List.copyOf(union);
+                hints = List.copyOf(hintUnion);
+            }
+        }
+        if (predicates.isEmpty() && hints.isEmpty()) return delegated;
+        ConnectorExpression rewritten = VariantFilterPushdown.removeClaims(remaining, constraint.getAssignments(), Set.copyOf(predicates));
+        VariantTableHandle result = new VariantTableHandle(filtered, predicates, hints);
+        if (delegated.isEmpty() && result.equals(handle) && rewritten.equals(constraint.getExpression())) return Optional.empty();
+        return Optional.of(new ConstraintApplicationResult<>(result,
+            delegated.map(ConstraintApplicationResult::getRemainingFilter).orElse(constraint.getSummary()), rewritten,
+            delegated.map(ConstraintApplicationResult::isPrecalculateStatistics).orElse(false)));
+    }
+
+    private static boolean supportsVariantScan(IcebergTableHandle table) {
+        return table.getTableType() == io.trino.plugin.iceberg.TableType.DATA
+            && !table.isRecordScannedFiles() && !table.getForAnalyze().orElse(false)
+            && table.getMaxScannedFileSize().isEmpty()
+            && table.getProjectedColumns().stream().noneMatch(IcebergColumnHandle::isMergeRowIdColumn);
+    }
+
+    private static boolean hasRowFilter(ConnectorTableHandle table) {
+        return table instanceof VariantTableHandle || table instanceof VisibilityTableHandle || table instanceof SpatialTableHandle;
     }
 
     /** Absorb only mandatory calls to our UDF on the observed visibility column. */
@@ -1265,7 +1328,12 @@ public class SpatialConnectorMetadata implements ConnectorMetadata {
     @Override
     public ConnectorTableProperties getTableProperties(ConnectorSession session,
                                                        ConnectorTableHandle table) {
-        return delegate.getTableProperties(session, SpatialTableHandle.unwrap(table));
+        ConnectorTableProperties properties = delegate.getTableProperties(session, SpatialTableHandle.unwrap(table));
+        if (!hasRowFilter(table)) return properties;
+        // Partition values describe files before our row filters. Exposing them lets
+        // MetadataQueryOptimizer replace the scan with Values and bypass claimed predicates.
+        return new ConnectorTableProperties(properties.getPredicate(), properties.getTablePartitioning(),
+            Optional.empty(), properties.getLocalProperties());
     }
 
     /**
@@ -1443,6 +1511,11 @@ public class SpatialConnectorMetadata implements ConnectorMetadata {
     public Optional<ProjectionApplicationResult<ConnectorTableHandle>> applyProjection(
             ConnectorSession session, ConnectorTableHandle handle,
             List<ConnectorExpression> projections, Map<String, ColumnHandle> assignments) {
+        if (handle instanceof VariantTableHandle variant) {
+            return applyProjection(session, variant.delegate(), projections, assignments)
+                .map(r -> new ProjectionApplicationResult<>(variant.withDelegate(r.getHandle()),
+                    r.getProjections(), r.getAssignments(), r.isPrecalculateStatistics()));
+        }
         if (handle instanceof VisibilityTableHandle visibility) {
             return applyProjection(session, visibility.delegate(), projections, assignments)
                 .map(r -> new ProjectionApplicationResult<>(visibility.withDelegate(r.getHandle()),
@@ -1450,6 +1523,25 @@ public class SpatialConnectorMetadata implements ConnectorMetadata {
         }
         Optional<ProjectionApplicationResult<ConnectorTableHandle>> result =
             delegate.applyProjection(session, SpatialTableHandle.unwrap(handle), projections, assignments);
+        if (variantSessionProperties && VariantPushdownConfig.projectionEnabled(session)
+                && SpatialTableHandle.unwrap(handle) instanceof IcebergTableHandle original && supportsVariantScan(original)) {
+            ConnectorTableHandle projectedHandle = result.map(ProjectionApplicationResult::getHandle)
+                .orElse(SpatialTableHandle.unwrap(handle));
+            if (projectedHandle instanceof IcebergTableHandle iceberg) {
+                List<ConnectorExpression> expressions = result.map(ProjectionApplicationResult::getProjections).orElse(projections);
+                Map<String, ColumnHandle> bindings = result.map(r -> {
+                    Map<String, ColumnHandle> map = new LinkedHashMap<>();
+                    r.getAssignments().forEach(assignment -> map.put(assignment.getVariable(), assignment.getColumn()));
+                    return map;
+                }).orElse(assignments);
+                var pruned = VariantProjectionPushdown.apply(iceberg, expressions, bindings);
+                if (pruned.isPresent()) {
+                    var update = pruned.get();
+                    result = Optional.of(new ProjectionApplicationResult<>(update.getHandle(), update.getProjections(),
+                        update.getAssignments(), result.map(ProjectionApplicationResult::isPrecalculateStatistics).orElse(false)));
+                }
+            }
+        }
         if (handle instanceof SpatialTableHandle spatial) {
             return result.map(r -> new ProjectionApplicationResult<>(spatial.withDelegate(r.getHandle()),
                 r.getProjections(), r.getAssignments(), r.isPrecalculateStatistics()));
@@ -1468,7 +1560,7 @@ public class SpatialConnectorMetadata implements ConnectorMetadata {
     @Override
     public Optional<LimitApplicationResult<ConnectorTableHandle>> applyLimit(
             ConnectorSession session, ConnectorTableHandle handle, long limit) {
-        if (handle instanceof SpatialTableHandle || handle instanceof VisibilityTableHandle) {
+        if (hasRowFilter(handle)) {
             return Optional.empty();   // limit/top-N must not precede authoritative row filtering
         }
         return delegate.applyLimit(session, SpatialTableHandle.unwrap(handle), limit);
@@ -1503,7 +1595,7 @@ public class SpatialConnectorMetadata implements ConnectorMetadata {
             ConnectorSession session, ConnectorTableHandle handle,
             List<AggregateFunction> aggregates, Map<String, ColumnHandle> assignments,
             List<List<ColumnHandle>> groupingSets) {
-        if (handle instanceof SpatialTableHandle || handle instanceof VisibilityTableHandle) {
+        if (hasRowFilter(handle)) {
             return Optional.empty();
         }
         return delegate.applyAggregation(session, SpatialTableHandle.unwrap(handle), aggregates, assignments, groupingSets);
@@ -1523,7 +1615,7 @@ public class SpatialConnectorMetadata implements ConnectorMetadata {
     public Optional<TopNApplicationResult<ConnectorTableHandle>> applyTopN(
             ConnectorSession session, ConnectorTableHandle handle,
             long topNCount, List<SortItem> sortItems, Map<String, ColumnHandle> assignments) {
-        if (handle instanceof SpatialTableHandle || handle instanceof VisibilityTableHandle) {
+        if (hasRowFilter(handle)) {
             return Optional.empty();   // limit/top-N must not precede authoritative row filtering
         }
         return delegate.applyTopN(session, SpatialTableHandle.unwrap(handle), topNCount, sortItems, assignments);
@@ -1914,6 +2006,20 @@ public class SpatialConnectorMetadata implements ConnectorMetadata {
                            ConnectorViewDefinition definition, Map<String, Object> viewProperties,
                            boolean replace) {
         delegate.createView(session, viewName, definition, viewProperties, replace);
+        geomCatalog.invalidate(viewName);
+    }
+
+    /**
+     * Refreshes a view definition via the delegate and invalidates its cached column metadata.
+     *
+     * @param session the connector session
+     * @param viewName the schema-qualified view name
+     * @param definition the refreshed view definition
+     */
+    @Override
+    public void refreshView(ConnectorSession session, SchemaTableName viewName,
+                            ConnectorViewDefinition definition) {
+        delegate.refreshView(session, viewName, definition);
         geomCatalog.invalidate(viewName);
     }
 

@@ -12,8 +12,6 @@ import scala.util.{Failure, Success, Try}
 
 /**
  * Utilities for reversing XZ2SFC index calculations
- *
- * This file was mostly generated using claude-sonnet-4-5
  */
 object XZ2Reversal {
 

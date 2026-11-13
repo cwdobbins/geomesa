@@ -603,35 +603,90 @@ class TrinoFilterToSQLTest {
     void variantStringEqualityPrefilterKeepsOtherTypesForResidual() throws Exception {
         setStructuralSchema();
         String sql = translator.variantPrefilter(ECQL.toFilter("\"$.blob.name\" = 'alice'"));
-        assertThat(sql).contains("TRY(\"blob\"['name'])");
-        assertThat(sql).contains("AS VARCHAR) AS VARIANT)");
-        assertThat(sql).contains("THEN TRY(\"blob\"['name']) = CAST('alice' AS VARIANT) ELSE TRUE END");
+        assertThat(sql).isEqualTo("geomesa_variant_may_equal(\"blob\", ARRAY['name'], CAST('alice' AS VARIANT))");
         assertThat(translator.variantPrefilter(ECQL.toFilter("'alice' = \"$.blob.name\""))).isEqualTo(sql);
+    }
+
+    @Test
+    void variantIntegerRangePrefiltersPreserveOperatorsWidthsAndBounds() throws Exception {
+        setStructuralSchema();
+        String[] operators = {">", ">=", "<", "<="};
+        String[] functions = {"gt", "gte", "lt", "lte"};
+        String[] reversed = {"lt", "lte", "gt", "gte"};
+        for (int i = 0; i < operators.length; i++) {
+            assertThat(translator.variantPrefilter(ECQL.toFilter("\"$.blob.outer.score\" " + operators[i] + " 100000")))
+                    .isEqualTo("geomesa_variant_may_" + functions[i] + "(\"blob\", ARRAY['outer', 'score'], CAST(CAST(100000 AS BIGINT) AS VARIANT))");
+            assertThat(translator.variantPrefilter(ECQL.toFilter("100000 " + operators[i] + " \"$.blob.outer.score\"")))
+                    .startsWith("geomesa_variant_may_" + reversed[i] + "(");
+        }
+        for (Number value : new Number[]{(byte) 10, (short) 1000, 100000, 1L << 53, -(1L << 53)}) {
+            assertThat(translator.variantPrefilter(ff.greater(ff.property("$.blob['odd\\'key']"), ff.literal(value))))
+                    .contains("ARRAY['odd''key']", value.toString());
+        }
+        for (Number value : new Number[]{(1L << 53) + 1, -(1L << 53) - 1, Long.MIN_VALUE, Long.MAX_VALUE,
+                Double.NaN, Double.POSITIVE_INFINITY, new java.math.BigDecimal("1E-1000000000")}) {
+            assertThat(translator.variantPrefilter(ff.greater(ff.property("$.blob.score"), ff.literal(value)))).isNull();
+        }
+        for (String path : new String[]{"$.props.score", "$.blob.items[*].score", "$.blob.*", "$.blob.items[0]", "$.blob" + ".a".repeat(65)}) {
+            assertThat(translator.variantPrefilter(ff.greater(ff.property(path), ff.literal(10)))).as(path).isNull();
+        }
+    }
+
+    @Test
+    void variantFractionalLiteralsPreserveTypeAndBoundSqlSize() throws Exception {
+        setStructuralSchema();
+        var property = ff.property("$.blob.score");
+        for (Number number : new Number[]{0.1d, -0.0d, Double.MIN_VALUE, Double.MAX_VALUE, 0.1f, -0.0f}) {
+            String type = number instanceof Float ? "REAL" : "DOUBLE";
+            assertThat(translator.variantPrefilter(ff.greater(property, ff.literal(number))))
+                    .contains("CAST(CAST('" + number + "' AS " + type + ") AS VARIANT)");
+        }
+        assertThat(translator.variantPrefilter(ff.greater(property, ff.literal(new java.math.BigDecimal("1.2300")))))
+                .contains("CAST(CAST('1.2300' AS DECIMAL(5, 4)) AS VARIANT)");
+        assertThat(translator.variantPrefilter(ff.greater(property, ff.literal(new java.math.BigDecimal("1E+3")))))
+                .contains("CAST(CAST('1000' AS DECIMAL(4, 0)) AS VARIANT)");
+        for (Number number : new Number[]{Float.NaN, Float.NEGATIVE_INFINITY, new java.math.BigDecimal("1E+1000000000"),
+                new java.math.BigDecimal("1E-39"), new java.math.BigDecimal("123456789012345678901234567890123456789")}) {
+            assertThat(translator.variantPrefilter(ff.greater(property, ff.literal(number)))).isNull();
+        }
+        assertThat(translator.variantPrefilter(ECQL.toFilter("\"$.blob.score\" >= 1.25"))).contains("AS DOUBLE");
     }
 
     @Test
     void variantPrefilterEscapesNestedKeysAndLiterals() throws Exception {
         setStructuralSchema();
         assertThat(translator.variantPrefilter(ff.equals(ff.property("$.blob.nested.name"), ff.literal("O'Brien"))))
-            .contains("\"blob\"['nested']['name']", "CAST('O''Brien' AS VARIANT)");
+            .contains("ARRAY['nested', 'name']", "CAST('O''Brien' AS VARIANT)");
         assertThat(translator.variantPrefilter(ff.equals(ff.property("$.blob['odd\\'name']"), ff.literal("x"))))
-            .contains("['odd''name']");
+            .contains("ARRAY['odd''name']");
     }
 
     @Test
     void variantPrefilterRejectsNegationCaseFoldingAndUnsupportedOperators() throws Exception {
         setStructuralSchema();
         for (String cql : new String[]{"NOT (\"$.blob.name\" = 'alice')", "\"$.blob.name\" <> 'alice'",
-                "\"$.blob.age\" > 30", "\"$.blob.age\" = 30", "\"$.props.name\" = 'alice'",
+                "\"$.blob.age\" = 30", "\"$.props.name\" = 'alice'",
                 "\"$.blob\" = 'alice'", "\"$.blob.name\" IS NULL"}) {
             assertThat(translator.variantPrefilter(ECQL.toFilter(cql))).as(cql).isNull();
         }
         assertThat(translator.variantPrefilter(ff.equal(ff.property("$.blob.name"), ff.literal("alice"), false)))
             .isNull();
-        for (String path : new String[]{"$.blob.*", "$.blob.tags[0]", "$.blob.scores.max()", "$.missing.name"}) {
-            assertThatThrownBy(() -> translator.variantPrefilter(ff.equals(ff.property(path), ff.literal("x"))))
-                .isInstanceOf(RuntimeException.class);
+        for (String path : new String[]{"$.blob.tags[0]", "$.blob.scores.max()", "$.missing.name"}) {
+            assertThat(translator.variantPrefilter(ff.equals(ff.property(path), ff.literal("x")))).isNull();
         }
+    }
+
+
+    @Test
+    void variantPrefilterDistinguishesLiteralKeysFromWildcardsAndBoundsPaths() throws Exception {
+        setStructuralSchema();
+        assertThat(translator.variantPrefilter(ff.equals(ff.property("$.blob['*']"), ff.literal("x"))))
+            .isEqualTo("geomesa_variant_may_equal(\"blob\", ARRAY['*'], CAST('x' AS VARIANT))");
+        assertThat(translator.variantPrefilter(ff.equals(ff.property("$.blob.*"), ff.literal("x"))))
+            .startsWith("geomesa_variant_fields_may_equal(\"blob\", CAST(ARRAY[] AS ARRAY(VARCHAR))");
+        assertThat(translator.variantPrefilter(ff.equals(ff.property("$.blob" + ".a".repeat(65)), ff.literal("x")))).isNull();
+        assertThat(translator.variantPrefilter(ff.equals(ff.property("$.blob.items[*].name"), ff.literal("x"))))
+            .isEqualTo("geomesa_variant_any_may_equal(\"blob\", ARRAY['items'], ARRAY['name'], CAST('x' AS VARIANT))");
     }
 
     @Test

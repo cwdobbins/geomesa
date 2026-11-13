@@ -17,6 +17,7 @@
 
     <properties>
         <skipITs>true</skipITs>
+        <iceberg.version>1.12.0</iceberg.version>
         <!-- Trino's Parquet column readers initialize vector classes even with vector decoding disabled. -->
         <maven.test.jvmargs>${maven.test.memory} ${maven.test.opens} --add-modules=jdk.incubator.vector</maven.test.jvmargs>
         <opentelemetry.version>1.67.0</opentelemetry.version> <!-- note: trino bundles 1.61.0, but that triggers a CVE in our scanning -->
@@ -122,7 +123,7 @@
             <version>${trino.version}</version>
             <scope>test</scope>
             <exclusions>
-                <!-- Only the function annotation parser is used; no server runtime is needed. -->
+                <!-- Engine smoke tests use a separate Trino test classpath; keep plugin unit tests small. -->
                 <exclusion>
                     <groupId>*</groupId>
                     <artifactId>*</artifactId>
@@ -246,6 +247,39 @@
             <artifactId>junit-jupiter</artifactId>
         </dependency>
         <dependency>
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-common</artifactId>
+            <scope>test</scope>
+            <exclusions>
+                <exclusion>
+                    <groupId>*</groupId>
+                    <artifactId>*</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-mapreduce-client-core</artifactId>
+            <scope>test</scope>
+            <exclusions>
+                <exclusion>
+                    <groupId>*</groupId>
+                    <artifactId>*</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-collections4</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.hadoop.thirdparty</groupId>
+            <artifactId>hadoop-shaded-guava</artifactId>
+            <version>1.5.0</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
             <groupId>org.assertj</groupId>
             <artifactId>assertj-core</artifactId>
         </dependency>
@@ -292,7 +326,7 @@
             <plugin>
                 <groupId>io.trino</groupId>
                 <artifactId>trino-maven-plugin</artifactId>
-                <version>24</version>
+                <version>${trino.maven.plugin.version}</version>
                 <extensions>true</extensions>
             </plugin>
         </plugins>

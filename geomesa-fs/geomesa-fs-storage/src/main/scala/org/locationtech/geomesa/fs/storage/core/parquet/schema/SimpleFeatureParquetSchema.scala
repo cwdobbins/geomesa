@@ -103,7 +103,8 @@ object SimpleFeatureParquetSchema extends LazyLogging {
       Option(value).map(key -> _)
     }
     // note: context meta goes second so that transforms override the file-level keys
-    apply(new PlainParquetConfiguration((kvMeta.toMap ++ gmMeta.toMap).asJava)).map(_.read())
+    apply(new PlainParquetConfiguration((kvMeta.toMap ++ gmMeta.toMap).asJava))
+      .map(withVariantFields(_, context.getFileSchema).read())
   }
 
   /**
@@ -113,7 +114,24 @@ object SimpleFeatureParquetSchema extends LazyLogging {
     * @return
     */
   def read(footer: FileMetaData): Option[SimpleFeatureParquetSchema] =
-    apply(new PlainParquetConfiguration(footer.getKeyValueMetaData)).map(_.read())
+    apply(new PlainParquetConfiguration(footer.getKeyValueMetaData)).map(withVariantFields(_, footer.getSchema).read())
+
+  // A feature type describes a VARIANT, not its per-file physical layout. Request the complete physical group
+  // so that typed fields are not lost when reading shredded files (including when transforming attributes).
+  private def withVariantFields(schema: SimpleFeatureParquetSchema, file: MessageType): SimpleFeatureParquetSchema = {
+    val variants = schema.sft.getAttributeDescriptors.asScala.collect {
+      case d if ObjectType.selectType(d).last == ObjectType.JSON && d.getJsonSchema().isEmpty =>
+        ColumnName(d.getLocalName).column
+    }.toSet
+    val fields = ParquetFields(schema.messageType.getFields.asScala.toSeq.map { field =>
+      if (variants.contains(field.getName) && file.containsField(field.getName)) {
+        file.getType(file.getFieldIndex(field.getName))
+      } else {
+        field
+      }
+    })
+    new SimpleFeatureParquetSchema(schema.sft, schema.metadata, fields.toMessageType(schema.sft.getTypeName), fields)
+  }
 
   /**
    * Get a schema for writing. Encoding can be configured through attribute `encoding` user data.
@@ -131,7 +149,9 @@ object SimpleFeatureParquetSchema extends LazyLogging {
         SftNameKey -> name,
         SftSpecKey -> spec,
       ) ++ Option(conf.get(PartitionKey)).map(PartitionKey -> _)
-      val parquet = schema(sft)
+      val layouts = Option(conf.get(VariantShredding.ConfigurationKey))
+        .fold(Map.empty[String, GroupType])(VariantShredding(sft, _))
+      val parquet = schema(sft, layouts)
       val messageType = {
         val base = parquet.toMessageType(sft.getTypeName)
         // if an iceberg name mapping is provided, stamp the table's field ids onto the schema by name,
@@ -163,9 +183,10 @@ object SimpleFeatureParquetSchema extends LazyLogging {
    * consistent, but the schema may be reduced (e.g. on read) based on the filter sft
    *
    * @param sft simple feature type
+   * @param layouts explicit VARIANT layouts keyed by original attribute name
    * @return
    */
-  private def schema(sft: SimpleFeatureType): ParquetFields = {
+  private def schema(sft: SimpleFeatureType, layouts: Map[String, GroupType]): ParquetFields = {
     val builder = Seq.newBuilder[Type]
     builder +=
       Types.required(PrimitiveTypeName.BINARY)
@@ -185,7 +206,9 @@ object SimpleFeatureParquetSchema extends LazyLogging {
         builder += BoundingBoxField.parquetSchema(name.column)
         builder += ZValueField.parquetSchema(name.column, objectType(1))
       } else if (objectType.last == ObjectType.JSON) {
-        builder += d.getJsonSchema().fold(buildVariantType(name.column))(buildStructuralType(name.column, _))
+        builder += d.getJsonSchema().fold[Type](layouts.getOrElse(d.getLocalName, buildVariantType(name.column))) {
+          buildStructuralType(name.column, _)
+        }
       } else {
         builder += buildType(name.column, objectType)
       }
@@ -247,20 +270,6 @@ object SimpleFeatureParquetSchema extends LazyLogging {
       .required(PrimitiveTypeName.BINARY).named("value")
       .named(name)
   }
-
-  // TODO instead of structural types, could use a variant with shredding, but trino doesn't support reading shredded variants yet
-  // val partiallyShredded: GroupType =
-  //   Types.buildGroup(Repetition.REQUIRED).as(LogicalTypeAnnotation.variantType(1.toByte))
-  //   .required(PrimitiveTypeName.BINARY).named("metadata")
-  //   .optional(PrimitiveTypeName.BINARY).named("value") // stores {custom_field_xyz: 123}
-  //   .optionalGroup
-  //     .optionalGroup
-  //       .optional(PrimitiveTypeName.BINARY).as(stringType).named("typed_value") // stores person.name field
-  //     .named("name")
-  //     .optionalGroup
-  //       .optional(PrimitiveTypeName.INT32).named("typed_value").named("age") // stores person.age field
-  //     .named("typed_value")
-  //   .named("person")
 
   private def buildStructuralType(name: String, schemaDef: String): Type = {
     // re-use the iceberg method so that the fields align

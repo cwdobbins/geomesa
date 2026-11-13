@@ -25,10 +25,14 @@ than expected.
 ``geomesa.trino.filter.client-variant-pushdown``
 ------------------------------------------------
 
-Defaults to ``false``. Set to ``true`` to enable a necessary SQL prefilter for case-sensitive string equality on plain
-object paths into schemaless ``json=true`` attributes stored as VARIANT. For example,
+Defaults to ``false``. Set to ``true`` to enable a necessary SQL prefilter for case-sensitive string equality on object, list-member and one-level object-field wildcard
+paths, and positive scalar numeric ranges on object paths, into schemaless ``json=true`` attributes
+stored as VARIANT. For example,
 ``"$.payload.category" = 'example'`` can reject nonmatching strings in Trino before returning documents
-to the client. Structured JSON attributes with a ``json-schema`` continue to use their existing ROW translation.
+to the client. Static ``jsonPath(...)`` expressions and reversed operands are also supported. Numeric candidates
+retain values outside the safe comparison/coercion boundary; the GeoTools residual remains authoritative.
+Structured JSON attributes with a ``json-schema`` continue to use their existing ROW translation.
+See :ref:`trino_variant_prefilter_hint` for the supported path subset and total candidate functions.
 
 The Boolean query hint ``QueryHints.TRINO_VARIANT_PREFILTER`` overrides this system property for an individual query.
 An explicit ``false`` disables the prefilter even when the system property is ``true``; omitting the hint uses the system

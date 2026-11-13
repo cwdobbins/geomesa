@@ -85,7 +85,7 @@ trait LocalObjectStore extends ObjectStore {
   }
 
   override def copy(from: URI, to: URI): Unit =
-    WithClose(new FileInputStream(toFile(from)), new FileOutputStream(toFile(to)))(IOUtils.copy)
+    WithClose(new FileInputStream(toFile(from)), new FileOutputStream(ensureParents(toFile(to))))(IOUtils.copy)
 
   override def delete(path: URI): Unit = toFile(path).delete()
 

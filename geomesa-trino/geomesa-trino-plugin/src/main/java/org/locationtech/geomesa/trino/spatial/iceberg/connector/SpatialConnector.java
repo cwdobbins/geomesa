@@ -7,11 +7,17 @@
  ***********************************************************************/
 
 package org.locationtech.geomesa.trino.spatial.iceberg.connector;
+import org.locationtech.geomesa.trino.variant.VariantPathDemand;
+import org.locationtech.geomesa.trino.variant.VariantFilePruning;
+import org.locationtech.geomesa.trino.variant.VariantPushdownConfig;
 import org.locationtech.geomesa.trino.security.AuthorizationResolver;
 import org.locationtech.geomesa.trino.security.VisibilityAccessControl;
 
 import io.trino.spi.connector.*;
 import io.trino.plugin.iceberg.IcebergConnector;
+import io.trino.plugin.iceberg.IcebergTableScanFilter;
+import org.apache.iceberg.DataFile;
+import org.apache.iceberg.Schema;
 import io.trino.plugin.base.classloader.ClassLoaderSafeConnectorPageSourceProviderFactory;
 import io.trino.spi.function.FunctionProvider;
 import io.trino.spi.function.table.ConnectorTableFunction;
@@ -23,6 +29,8 @@ import org.locationtech.geomesa.trino.spatial.iceberg.GeoMesaColumnCatalog;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Function;
+import java.util.function.Predicate;
 
 /**
  * Wraps Trino's built-in Iceberg connector, overriding only getMetadata() to
@@ -34,6 +42,7 @@ import java.util.Set;
 public class SpatialConnector implements Connector {
 
     private final Connector delegate;
+    private final VariantPushdownConfig variantConfig;
     private final GeoMesaColumnCatalog geomCatalog;
     private final ConnectorAccessControl accessControl;
     private final boolean bboxShortCircuit;
@@ -145,6 +154,14 @@ public class SpatialConnector implements Connector {
     public SpatialConnector(Connector delegate, String catalogName, AuthorizationResolver resolver,
                             boolean bboxShortCircuit, boolean useInvokerAuths,
                             boolean visibilityPruningEnabled, Set<String> visibilityExpressions) {
+        this(delegate, catalogName, resolver, bboxShortCircuit, useInvokerAuths, visibilityPruningEnabled,
+            visibilityExpressions, VariantPushdownConfig.DEFAULT);
+    }
+
+    public SpatialConnector(Connector delegate, String catalogName, AuthorizationResolver resolver,
+            boolean bboxShortCircuit, boolean useInvokerAuths, boolean visibilityPruningEnabled,
+            Set<String> visibilityExpressions, VariantPushdownConfig variantConfig) {
+        this.variantConfig = variantConfig;
         this.delegate = delegate;
         this.geomCatalog = new GeoMesaColumnCatalog();
         this.accessControl = resolver == null ? null
@@ -215,7 +232,8 @@ public class SpatialConnector implements Connector {
             useInvokerAuths,
             resolver,
             visibilityPruningEnabled,
-            visibilityExpressions
+            visibilityExpressions,
+            true
         );
     }
 
@@ -239,6 +257,20 @@ public class SpatialConnector implements Connector {
                                                   Set<ColumnHandle> dynamicFilterColumns,
                                                   Constraint constraint) {
                 ConnectorTableHandle unwrapped = SpatialTableHandle.unwrap(table);
+                Function<Schema, Predicate<DataFile>> fileFilter = null;
+                Set<Integer> fileFilterColumns = Set.of();
+                if (table instanceof VariantTableHandle variant) {
+                    var iceberg = (io.trino.plugin.iceberg.IcebergTableHandle) unwrapped;
+                    var projected = new java.util.HashSet<>(iceberg.getProjectedColumns());
+                    projected.addAll(VariantPathDemand.columns(variant.predicates(), variant.hints()).values());
+                    unwrapped = iceberg.withProjectedColumns(projected);
+                    if (session != null && session.getProperty(VariantPushdownConfig.FILTER_MODE, VariantPushdownConfig.Mode.class)
+                            == VariantPushdownConfig.Mode.TYPED) {
+                        fileFilterColumns = VariantFilePruning.columns(variant.predicates());
+                        if (!fileFilterColumns.isEmpty()) fileFilter = schema -> VariantFilePruning.predicate(schema, variant.predicates());
+                    }
+                    table = variant.delegate();
+                }
                 if (table instanceof VisibilityTableHandle visibility) {
                     java.util.Set<ColumnHandle> statsColumns = new java.util.HashSet<>(dynamicFilterColumns);
                     statsColumns.add(visibility.visibilityColumn());
@@ -246,7 +278,10 @@ public class SpatialConnector implements Connector {
                         ((io.trino.plugin.iceberg.IcebergTableHandle) unwrapped).getProjectedColumns());
                     projected.add(visibility.visibilityColumn());
                     unwrapped = ((io.trino.plugin.iceberg.IcebergTableHandle) unwrapped).withProjectedColumns(projected);
-                    return splitManager.getSplits(transaction, session, unwrapped, statsColumns, constraint);
+                    dynamicFilterColumns = statsColumns;
+                }
+                if (fileFilter != null) {
+                    unwrapped = new IcebergTableScanFilter((io.trino.plugin.iceberg.IcebergTableHandle) unwrapped, fileFilterColumns, fileFilter);
                 }
                 return splitManager.getSplits(transaction, session, unwrapped, dynamicFilterColumns, constraint);
             }
@@ -261,7 +296,8 @@ public class SpatialConnector implements Connector {
     @Override
     public ConnectorPageSourceProvider getPageSourceProvider() {
         ConnectorPageSourceProvider provider = delegate.getPageSourceProvider();
-        return new VisibilityPageSourceProvider(bboxShortCircuit ? new SpatialPageSourceProvider(provider) : provider);
+        return new VariantPageSourceProvider(new VisibilityPageSourceProvider(
+            bboxShortCircuit ? new SpatialPageSourceProvider(provider) : provider));
     }
 
     /**
@@ -274,11 +310,11 @@ public class SpatialConnector implements Connector {
         if (delegate instanceof IcebergConnector iceberg) {
             var footerFactory = CustomFooterProviderFactory.from(iceberg.getInjector());
             return new ClassLoaderSafeConnectorPageSourceProviderFactory(
-                () -> footerFactory.create(bboxShortCircuit), IcebergConnector.class.getClassLoader());
+                memoryContext -> footerFactory.create(bboxShortCircuit, memoryContext), IcebergConnector.class.getClassLoader());
         }
         ConnectorPageSourceProviderFactory factory = delegate.getPageSourceProviderFactory();
-        return () -> new VisibilityPageSourceProvider(bboxShortCircuit
-            ? new SpatialPageSourceProvider(factory.createPageSourceProvider()) : factory.createPageSourceProvider());
+        return memoryContext -> new VariantPageSourceProvider(new VisibilityPageSourceProvider(bboxShortCircuit
+            ? new SpatialPageSourceProvider(factory.createPageSourceProvider(memoryContext)) : factory.createPageSourceProvider(memoryContext)));
     }
 
     /**
@@ -378,7 +414,9 @@ public class SpatialConnector implements Connector {
      */
     @Override
     public List<PropertyMetadata<?>> getSessionProperties() {
-        return delegate.getSessionProperties();
+        var properties = new java.util.ArrayList<PropertyMetadata<?>>(delegate.getSessionProperties());
+        properties.addAll(variantConfig.sessionProperties());
+        return List.copyOf(properties);
     }
 
     /**

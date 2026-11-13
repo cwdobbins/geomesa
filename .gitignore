@@ -3,6 +3,10 @@ build/scala*
 build/*.jar
 build/build.out
 docs/_build
+docs/superpowers
+docs/variant
+/AGENTS.md
+.claude
 *.pyc
 *.iws
 *.ipr

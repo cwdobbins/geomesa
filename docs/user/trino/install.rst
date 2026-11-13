@@ -215,3 +215,25 @@ JAR installed in the Trino cluster **must** match the version of the
 ``geomesa-plugin`` JARs installed in the ``WEB-INF/lib`` directory of GeoServer.
 
 See :ref:`upgrade_guide` for more details on upgrading between versions.
+
+Shredded VARIANT reader artifacts
+--------------------------------
+
+This branch packages the ``484-shredded-3`` Parquet and Iceberg reader artifacts inside the GeoMesa
+connector ZIP for stock Trino 484. Install the same ZIP on the coordinator and every worker.
+The server itself remains stock; do not copy a forked ``trino-spi`` or ``trino-main`` into the plugin.
+The bundled plugin-toolkit SPI compatibility marker must read ``484``.
+
+When building these artifacts from the companion Trino checkout, use its ``stock-spi`` Maven
+profile. It changes the toolkit marker for plugin packaging; ordinary fork builds retain the
+project-version marker. Build GeoMesa against the same Maven repository after installing the
+reader artifacts, then verify the ZIP contents and its SHA-256 before running the stock-container
+tests. The SQL smoke/benchmark runner is ``geomesa-trino/geomesa-trino-plugin/bin/test-variant-sql.py``;
+it accepts ``--trino-checkout``, ``--maven-repo`` for the matching artifact repository, and optional
+``--benchmark``, ``--forks``, ``--rows``, ``--warmup`` and
+``--repeats`` arguments. Each benchmark mode uses the same settings for planning and execution.
+
+These paired artifacts also provide bounded numeric/array row-group pruning and exact-string
+object-path file exclusion. The source-data pilot does not justify broad migration from existing
+native nested schemas. Reader correctness and local benchmarks do not replace workload-specific
+production visibility/recovery checks, realistic file-size tests or cold-storage acceptance.

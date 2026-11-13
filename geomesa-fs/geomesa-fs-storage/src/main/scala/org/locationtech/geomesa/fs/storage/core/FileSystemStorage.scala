@@ -13,7 +13,6 @@ import io.micrometer.core.instrument.Tags
 import org.apache.commons.codec.digest.MurmurHash3
 import org.apache.hadoop.fs.Path
 import org.apache.iceberg._
-import org.apache.iceberg.parquet.ParquetUtil
 import org.apache.iceberg.types.{Conversions, Types}
 import org.apache.iceberg.util.LocationUtil
 import org.apache.parquet.hadoop.example.GroupReadSupport
@@ -30,7 +29,7 @@ import org.locationtech.geomesa.fs.storage.core.iceberg.FileBoundsParser.StringP
 import org.locationtech.geomesa.fs.storage.core.iceberg._
 import org.locationtech.geomesa.fs.storage.core.observer.FileSystemObserverFactory.CompositeObserver
 import org.locationtech.geomesa.fs.storage.core.observer.{FileSystemObserver, FileSystemObserverFactory}
-import org.locationtech.geomesa.fs.storage.core.parquet.io.{ParquetFileSystemReader, ParquetFileSystemWriter}
+import org.locationtech.geomesa.fs.storage.core.parquet.io.{ParquetFileMetrics, ParquetFileSystemReader, ParquetFileSystemWriter}
 import org.locationtech.geomesa.fs.storage.core.schema.{BoundingBoxField, ColumnName, SimpleFeatureSchema}
 import org.locationtech.geomesa.fs.storage.core.schemes.PartitionScheme
 import org.locationtech.geomesa.fs.storage.core.utils.FileScan.FluentScan
@@ -327,7 +326,9 @@ case class FileSystemStorage(
 
     override def partitions(filter: Filter): Seq[Partition] = files().forFilter(filter).scan().map(t => partition(t.file())).distinct
 
-    override def register(files: Map[Partition, Seq[URI]]): Seq[DataFile] = {
+    override def register(files: Map[Partition, Seq[URI]]): Seq[DataFile] = register(files, Map.empty)
+
+    override def register(files: Map[Partition, Seq[URI]], snapshotProperties: Map[String, String]): Seq[DataFile] = {
       val dataFiles = files.toSeq.flatMap { case (partition, paths) =>
         paths.map { path =>
           val destination = newFilePath()
@@ -340,6 +341,7 @@ case class FileSystemStorage(
 
       if (dataFiles.nonEmpty) {
         val append = table.newAppend()
+        snapshotProperties.foreach { case (key, value) => append.set(key, value) }
         dataFiles.foreach(append.appendFile)
         append.commit()
       }
@@ -391,7 +393,7 @@ case class FileSystemStorage(
 
   private[core] def toDataFile(path: String, partition: Partition, spec: PartitionSpec): DataFile = {
     val inputFile = table.io().newInputFile(path)
-    val metrics = ParquetUtil.fileMetrics(inputFile, metricsConfig, null)
+    val metrics = ParquetFileMetrics.fileMetrics(inputFile, metricsConfig)
     DataFiles.builder(spec)
       .withFormat(FileFormat.PARQUET)
       .withPath(inputFile.location())
@@ -625,6 +627,22 @@ object FileSystemStorage extends LazyLogging {
      * @return registered files
      */
     def register(files: Map[Partition, Seq[URI]]): Seq[DataFile]
+
+    /**
+     * Register files with properties recorded in the same snapshot as the append. Callers can use a
+     * unique attempt identifier to locate the committed files if the commit acknowledgement is lost.
+     * Empty registrations do not create a snapshot. This does not retry or deduplicate an append.
+     *
+     * @param files files to register
+     * @param snapshotProperties properties attached to the append snapshot
+     * @return registered files
+     */
+    def register(files: Map[Partition, Seq[URI]], snapshotProperties: Map[String, String]): Seq[DataFile] = {
+      if (snapshotProperties.nonEmpty) {
+        throw new UnsupportedOperationException("This storage does not support snapshot properties when registering files")
+      }
+      register(files)
+    }
 
     /**
      * Register new files with this storage instance. The files must already be in a compatible format.

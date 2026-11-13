@@ -126,6 +126,19 @@ class TrinoFilterPlanningTest {
             .hasMessageContaining("disabled");
     }
     @Test
+    void negatedVariantRangesRetainOriginalMissingValueSemantics() throws Exception {
+        var filter = ECQL.toFilter("NOT (\"$.props.score\" > 100000)");
+        var result = TrinoFeatureSource.splitFilter(filter, schema, true, ALL);
+        assertThat(result.pushableSql()).isNull();
+        assertThat(result.residualAttributes()).containsExactly("props");
+        for (String json : new String[]{null, "{}", "{\"score\":null}", "{\"score\":99999}", "{\"score\":100001}"}) {
+            var feature = new org.geotools.feature.simple.SimpleFeatureBuilder(schema).buildFeature("oracle");
+            feature.setAttribute("props", json);
+            assertThat(result.residual().evaluate(feature)).as(json).isEqualTo(filter.evaluate(feature));
+        }
+    }
+
+    @Test
     void removesWholeWorldIntersectionPredicatesOnIndexedGeometry() throws Exception {
         String world = "POLYGON ((-180 -90, 180 -90, 180 90, -180 90, -180 -90))";
         for (String cql : new String[]{"BBOX(geom, -180, -90, 180, 90)",
@@ -177,6 +190,48 @@ class TrinoFilterPlanningTest {
         var result = TrinoFeatureSource.splitFilter(ff.equal(in, ff.literal(true), true), schema, false, NONE);
         assertThat(result.pushableSql()).contains("IN", "'alice'", "'bob'");
         assertThat(result.residual()).isNull();
+    }
+
+    @Test
+    void variantWildcardAndStaticFunctionFormsKeepTheirResiduals() throws Exception {
+        var cases = java.util.Map.of(
+            "\"$.props.items[*].name\" = 'match'", "geomesa_variant_any_may_equal",
+            "\"$.props.tags[*]\" = 'match'", "geomesa_variant_any_may_equal",
+            "\"$.props.bag.*.name\" = 'match'", "geomesa_variant_fields_may_equal",
+            "jsonPath('$.props.name') = 'match'", "geomesa_variant_may_equal",
+            "jsonPath(props, 'items[*].name') = 'match'", "geomesa_variant_any_may_equal",
+            "\"$.props.outer.score\" >= 100000", "geomesa_variant_may_gte",
+            "jsonPath(props, 'outer.score') < 100000", "geomesa_variant_may_lt");
+        for (var entry : cases.entrySet()) {
+            var filter = ECQL.toFilter(entry.getKey());
+            var result = TrinoFeatureSource.splitFilter(filter, schema, true, PARTIAL);
+            assertThat(result.pushableSql()).as(entry.getKey()).startsWith(entry.getValue());
+            assertThat(result.residual()).isNotNull();
+            assertThat(result.residualAttributes()).containsExactly("props");
+            assertThat(TrinoFeatureSource.splitFilter(filter, schema, false, ALL).pushableSql()).isNull();
+            assertThatThrownBy(() -> TrinoFeatureSource.splitFilter(filter, schema, true, NONE)).hasMessageContaining("disabled");
+        }
+    }
+
+    @Test
+    void candidateFiltersNeverEscapeOrNotOrDynamicPathScopes() throws Exception {
+        for (String cql : new String[]{
+                "NOT (\"$.props.items[*].name\" = 'match')",
+                "\"$.props.name\" = 'match' OR name = 'other'",
+                "\"$.props.groups[*].items[*].name\" = 'match'",
+                "\"$.props..name\" = 'match'",
+                "jsonPath(props, name) = 'match'",
+                "NOT (\"$.props.score\" > 100000)",
+                "\"$.props.score\" > 100000 OR name = 'other'"}) {
+            assertThat(TrinoFeatureSource.splitFilter(ECQL.toFilter(cql), schema, true, ALL).pushableSql()).as(cql).isNull();
+        }
+        var ff = CommonFactoryFinder.getFilterFactory();
+        for (var action : org.geotools.api.filter.MultiValuedFilter.MatchAction.values()) {
+            var filter = ff.equal(ff.property("$.props.tags[*]"), ff.literal("match"), true, action);
+            var result = TrinoFeatureSource.splitFilter(filter, schema, true, PARTIAL);
+            assertThat(result.pushableSql()).startsWith("geomesa_variant_any_may_equal");
+            assertThat(((org.geotools.api.filter.PropertyIsEqualTo) result.residual()).getMatchAction()).isEqualTo(action);
+        }
     }
 
 }

@@ -33,7 +33,7 @@ final class ChannelPrefixSourcePage implements SourcePage {
     }
     @Override public int getChannelCount() { return channelCount; }
     @Override public Block getBlock(int channel) {
-        if (channel >= channelCount) {
+        if (channel < 0 || channel >= channelCount) {
             throw new IndexOutOfBoundsException("channel " + channel + " >= " + channelCount);
         }
         return delegate.getBlock(channel);
@@ -45,7 +45,15 @@ final class ChannelPrefixSourcePage implements SourcePage {
         }
         return delegate.getColumns(channels);
     }
-    @Override public Page getColumns(int[] channels) { return delegate.getColumns(channels); }
+    @Override public Page getColumns(int[] channels) {
+        for (int channel : channels) {
+            if (channel < 0 || channel >= channelCount) throw new IndexOutOfBoundsException("channel " + channel);
+        }
+        return delegate.getColumns(channels);
+    }
+    @Override public boolean trySelectPositions(int[] positions, int offset, int size) {
+        return delegate.trySelectPositions(positions, offset, size);
+    }
     @Override public void selectPositions(int[] positions, int offset, int size) {
         delegate.selectPositions(positions, offset, size);
     }

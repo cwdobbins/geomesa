@@ -25,6 +25,16 @@ supported:
       - ``true``
       - Runs views in this catalog as the invoker (user) rather than the view definer (see below).
 
+    * - ``geomesa.variant.filter-mode``
+      - ``off``
+      - ``off``, ``reference`` or ``typed`` enforcement of total VARIANT predicates. Typed mode includes bounded row-group and exact-string object-path file pruning; see :ref:`trino_variant_prefilter_hint`.
+    * - ``geomesa.variant.projection-pushdown-enabled``
+      - ``false``
+      - Requests paths needed by supported projected VARIANT expressions.
+    * - ``geomesa.variant.native-prefilter-enabled``
+      - ``false``
+      - Conservative native equality, IN and null-test prefilters in typed mode. Engine residuals remain.
+
 .. _trino_use_invoker_auths:
 
 View authorizations
